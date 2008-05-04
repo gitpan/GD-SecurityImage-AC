@@ -15,5 +15,16 @@ if($@) {
       database_file
       generate_code
       new
+      create_sound_file
+      data_folder
+      debug
+      expire
+      height
+      images_folder
+      keep_failures
+      output_folder
+      type
+      version
+      width
    /]});
 }

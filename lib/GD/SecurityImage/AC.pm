@@ -1,13 +1,17 @@
 package GD::SecurityImage::AC;
 # drop-in replacement for Authen::Captcha
 use strict;
-use vars qw[$VERSION $AUTOLOAD];
+use vars qw($VERSION);
 use GD::SecurityImage;
 use Digest::MD5 qw(md5_hex);
 use File::Spec;
-use Fcntl qw(:flock);
+use Fcntl qw(:flock); # imports LOCK_NB, LOCK_EX, LOCK_SH, LOCK_UN (among other things)
+use Symbol; # imports 'gensym'
 
-$VERSION = '1.10';
+BEGIN {
+   $VERSION = '1.11';
+   @Authen::Captcha::ISA = ('GD::SecurityImage::AC');
+}
 
 sub new {
    my $class = shift;
@@ -28,16 +32,71 @@ sub new {
    }
    $self->{_keep_failures} = $opts{keep_failures} ? 1 : 0;
    srand( time() ^ ($$ + ($$ << 15)) ) if $] < 5.005; # create a random seed if perl version less than 5.005
-   $self->_unt_output_folder;
-   $self;
+   return $self;
 }
 
-sub _unt_output_folder { # todo
+sub _lock_ex { shift->_lock(&LOCK_EX); }
+sub _lock_sh { shift->_lock(&LOCK_SH); }
+sub _lock_un { shift->_lock(&LOCK_UN); }
+
+sub _lock { # Non-blocking locking with a timeout
    my $self = shift;
-   return unless defined $self->{_output_folder};
-   $self->{_output_folder} =~ /(.*)/;
-   $self->{_output_folder} = $1;
+
+   my ($lock_mode) = @_;
+
+   my $lock_handle  = $self->_lock_handle;
+   my $timeout      = 10; # seconds
+   my $count_timer  = 10 * $timeout;
+   my $lock_result;
+   while (! ($lock_result = flock ($lock_handle, $lock_mode | &LOCK_NB))) {
+      if (! $count_timer--) {
+         my $package = __PACKAGE__;
+         die("${package}::_lock() - Failed to obtain lock in $timeout seconds: $!");
+      }
+      # sleep for 1/10th of a second before trying again
+      select (undef,undef,undef,0.1);
+   }
    return;
+}
+
+sub _lock_handle { # returns an open filehandle to use for locking
+   my $self = shift;
+
+   my $lock_handle = $self->{'_lock_handle'};
+   return $lock_handle if defined ($lock_handle);
+   my $lock_file = $self->_lock_file;
+   $lock_handle  = gensym;
+   if (! open ($lock_handle,"+>$lock_file")) {
+      my $package = __PACKAGE__;
+      die("${package}::_lock_handle() - Unable to open '$lock_file' for locking: $!");
+   }
+   
+   $self->{'_lock_handle'} = $lock_handle;
+   return $lock_handle;
+}
+
+sub _lock_file { # Returns the lock file path
+   my $self = shift;
+
+   my $package = __PACKAGE__;
+   my $lock_file = $self->{_lock_file};
+   return $lock_file if (defined $lock_file);
+   my $data_folder = $self->{_data_folder};
+   unless (defined ($data_folder)) {
+      die("${package}::_lock_file() - 'data_folder' is not set")
+   }
+   unless (-e $data_folder && -d _) {
+      die("${package}::_lock_file() - '$data_folder' either does not exist or is not a directory")
+   }
+   $lock_file = File::Spec->catfile($data_folder,'codes.lck');
+   $self->{_lock_file} = $lock_file;
+   return $lock_file;
+}
+
+sub _untaint { # This doesn't make things safe. It just removes the taint flag. Use wisely.
+   my ($value) = @_;
+   my ($untainted_value) = $value =~ m/^(.*)$/s;
+   return $untainted_value;
 }
 
 sub gdsi {
@@ -90,7 +149,6 @@ sub database_data {
    my $db   = $self->database_file;
    local *DATA;
    open   DATA, '<'.$db  or die "Can't open $db for reading: $!\n";
-   flock  DATA, LOCK_SH;
    my @data = <DATA>;
    close  DATA;
    return @data;
@@ -110,16 +168,26 @@ sub check_code {
    my $crypt  = shift;
    my $db     = $self->database_file;
      ($code   = lc $code) =~ tr/01/ol/;
-   my $md5    = md5_hex($code); # remove 0-1
+   my $md5    = _untaint(md5_hex($code)); # remove 0-1
    my $now    = time;
    my $rvalue = 0;
    my $passed = 0;
    my $new    = ''; # saved entries
    my $found;
+
+   # make taint happy
+   local $ENV{'PATH'} = '';
+   local $ENV{'ENV'} = '';
+   local $ENV{'IFS'} = '';
+   local $ENV{'CDPATH'} = '';
+   local $ENV{'BASH_ENV'} = '';
+
+   $self->_lock_ex;
+
    foreach my $line ($self->database_data) {
       chomp $line;
       my ($data_time, $data_code) = split /::/, $line;
-      my $png_file = File::Spec->catfile($self->{_output_folder}, $data_code . '.png');
+      my $png_file = File::Spec->catfile($self->{_output_folder}, _untaint($data_code) . '.png');
       if ($data_code eq $crypt) { # the crypt was found in the database
          if (($now - $data_time) > $self->{_expire}) { 
             $rvalue = -1; # the crypt was found but has expired
@@ -141,9 +209,13 @@ sub check_code {
    # update database
    local *DATA;
    open   DATA, '>'.$db  or die "Can't open $db for writing: $!\n";
-   flock  DATA, LOCK_EX;
+   # Turn on autoflush for our output handle. I have seen rare cases where locking fails because of perl buffers without this.
+   my $temp_fh = select(DATA); $| = 1; select($temp_fh);
    print  DATA $new;
    close  DATA;
+
+   $self->_lock_un;
+
    if ($md5 eq $crypt) { # solution was correct
       if ($found) {
          $rvalue = 1;  # solution was correct and was found in database - passed
@@ -161,10 +233,20 @@ sub generate_code {
    my $len   = shift;
    my $code  = '';
       $code .= chr( int(rand 4) == 0 ? (int(rand 7)+50) : (int(rand 25)+97)) for 1..$len;
-   my $md5   = md5_hex($code);
+   my $md5   = _untaint(md5_hex($code));
    my $now   = time;
    my $new   = "";
    my $db    = $self->database_file;
+
+   # make taint happy
+   local $ENV{'PATH'} = '';
+   local $ENV{'ENV'} = '';
+   local $ENV{'IFS'} = '';
+   local $ENV{'CDPATH'} = '';
+   local $ENV{'BASH_ENV'} = '';
+
+   $self->_lock_ex;
+
    foreach my $line ($self->database_data) { # clean expired codes and images
       chomp $line;
       my ($data_time, $data_code) = split /::/, $line;
@@ -173,7 +255,7 @@ sub generate_code {
       $data_time =~ m/^([0-9]+)$/s;
       $data_time = $1 or die "Bad timeout data!";
       if (($now - $data_time) > $self->{_expire} || $data_code eq $md5) {   # remove expired captcha, or a dup
-         my $png_file = File::Spec->catfile($self->{_output_folder},$data_code . ".png");
+         my $png_file = File::Spec->catfile($self->{_output_folder}, _untaint($data_code) . ".png");
          _unlink($png_file) or die "Can't remove png file [$png_file]\n";
       } else {
          $new .= $line."\n";
@@ -187,208 +269,33 @@ sub generate_code {
    open    FILE, '>'.$file or die "Can't open $file for writing: $!\n";
    open    DATA, '>'.$db   or die "Can't open $db   for writing: $!\n";
 
+   # Turn on autoflush for our output handles. I have seen rare cases where locking fails because of perl buffers without this.
+   my $temp_fh = select(DATA); $| = 1; select(FILE); $| = 1; select($temp_fh);
+
    # save image data
-   flock   FILE, LOCK_EX;
    binmode FILE;
    print   FILE $self->create_image_file($code, $md5);
    close   FILE;
 
    # save the code to database
-   flock   DATA, LOCK_EX;
    print   DATA $new, $now,"::",$md5,"\n";
    close   DATA;
+
+   $self->_lock_un;
+
    return  wantarray ? ($md5, $code) : $md5;
 }
 
-sub AUTOLOAD { # junk methods
-   my $self = shift;
-  (my $name = $AUTOLOAD) =~ s[.*:][];
-   my $val  = shift;
-      if ($name =~ m[^(output_folder|images_folder|data_folder|debug)$]) { $self->{"_$name"} = $val if defined $val;         return $self->{"_$name"}         } 
-   elsif ($name =~ m[^(expire|width|height)$]                          ) { $self->{"_$name"} = $val if $val and $val >= 0;   return $self->{"_$name"}         } 
-   elsif ($name eq 'keep_failures'                                     ) { $self->{"_$name"} = $val ? 1 : 0 if defined $val; return $self->{"_$name"}         }
-   elsif ($name eq 'version'                                           ) {                                                   return $VERSION                  } 
-   elsif ($name eq 'create_sound_file'                                 ) {                                                   return "there is no such thing!" }
-   elsif ($name eq 'type'                                              ) {                                                   return 'image'                   }
-   else  { die "No such method $name!" }
-}
-
-sub DESTROY {}
-
-package # we declare this in two lines to by-pass CPAN indexer...
-        Authen::Captcha; # enable emulation by name
-use base qw[GD::SecurityImage::AC];
+sub output_folder { my ($self, $val) = @_; $self->{"_output_folder"} = $val if defined $val; return $self->{"_output_folder"}; }
+sub images_folder { my ($self, $val) = @_; $self->{"_images_folder"} = $val if defined $val; return $self->{"_images_folder"}; }
+sub data_folder   { my ($self, $val) = @_; $self->{"_data_folder"}   = $val if defined $val; return $self->{"_data_folder"};   }
+sub debug         { my ($self, $val) = @_; $self->{"_debug"}         = $val if defined $val; return $self->{"_debug"};         }
+sub expire        { my ($self, $val) = @_; $self->{"_expire"} =  $val if $val and $val >= 0; return $self->{"_expire"}; }
+sub width         { my ($self, $val) = @_; $self->{"_width"} =   $val if $val and $val >= 0; return $self->{"_width"};  }
+sub height        { my ($self, $val) = @_; $self->{"_height"} =  $val if $val and $val >= 0; return $self->{"_height"}; }
+sub version       { return $VERSION; }
+sub keep_failures { my ($self, $val) = @_; $self->{"_keep_failures"} = $val ? 1 : 0 if defined $val; return $self->{"_keep_failures"}; }
+sub create_sound_file { return 'there is no such thing!'; }
+sub type          { return 'image' }
 
 1;
-
-__END__
-
-=head1 NAME
-
-GD::SecurityImage::AC - A drop-in replacement for Authen::Captcha.
-
-=head1 SYNOPSIS
-
-  use GD::SecurityImage::AC;
-
-  # create a new object
-  my $captcha = Authen::Captcha->new();
-
-  # set the data_folder. contains flatfile db to maintain state
-  $captcha->data_folder('/some/folder');
-
-  # set directory to hold publicly accessable images
-  $captcha->output_folder('/some/http/folder');
-
-  # Alternitively, any of the methods to set variables may also be
-  # used directly in the constructor
-
-  my $captcha = Authen::Captcha->new(
-    data_folder => '/some/folder',
-    output_folder => '/some/http/folder',
-    );
-
-  # create a captcha. Image filename is "$md5sum.png"
-  my $md5sum = $captcha->generate_code($number_of_characters);
-
-  # check for a valid submitted captcha
-  #   $code is the submitted letter combination guess from the user
-  #   $md5sum is the submitted md5sum from the user (that we gave them)
-  my $results = $captcha->check_code($code,$md5sum);
-  # $results will be one of:
-  #          1 : Passed
-  #          0 : Code not checked (file error)
-  #         -1 : Failed: code expired
-  #         -2 : Failed: invalid code (not in database)
-  #         -3 : Failed: invalid code (code does not match crypt)
-  ##############
-
-=head1 DESCRIPTION
-
-This module is a drop-in GD::SecurityImage replacement for Authen::Captcha. 
-Module is mostly compatible with Authen::Captcha. You can just replace
-
-   use Authen::Captcha;
-
-line in your programs with
-
-   use GD::SecurityImage::AC;
-
-to enable GD::SecurityImage interface. Alternatively, you can use
-
-   use GD::SecurityImage backend => 'AC';
-
-Regular GD::SecurityImage interface is supported with an extra method: 
-C<gdsi>. Also see the C<CAVEATS> section for incompatibilities.
-
-This module uses: C<GD::SecurityImage>, C<Digest::MD5>, C<File::Spec> and 
-C<Fcntl> modules.
-
-If you are writing a captcha handler from scratch, this module is 
-B<not recommended>. You must use C<GD::SecurityImage> directly. This 
-module can be used for older Authen::Captcha applications only. And 
-features are (and will be) limited with Authen::Captcha capabilities.
-
-B<Do not use this module if you have any doubt>.
-
-=head1 METHODS
-
-See L<Authen::Captcha> for the methods and usage.
-
-=head2 gdsi
-
-This method is used to set L<GD::SecurityImage> parameters. Three
-methods are supported: C<new>, C<create> and C<particle>. Parameter
-types and names are identical to GD::SecurityImage parameters:
-
-   $captcha->gdsi(new      => {name => value},
-                  create   => [param1, param2, ...],
-                  particle => [param1, param2]);
-
-C<new> is a hashref while the other two are arrayrefs. 
-See L<GD::SecurityImage> for information about these parameters.
-
-C<gdsi> method must be called just after creating the object:
-
-   my $captcha = Authen::Captcha->new;
-   $captcha->gdsi(
-      new => {
-               width    => 350,
-               height   => 100,
-               lines    => 10,
-               font     => "/absolute/path/to/your.ttf",
-               scramble => 1,
-               ptsize   => 24,
-      },
-      create   => [ttf => 'box', '#80C0F0', '#0F644B'],
-      particle => [115, 250],
-   );
-
-If you don't use this method, the captcha image will be generated with
-default options.
-
-C<gdsi> returns the object itself. So, you can create your object like this:
-
-   my $captcha = Authen::Captcha->new( ... )->gdsi( ... );
-
-=head1 CAVEATS
-
-=over 4
-
-=item *
-
-width and height parameters are *not* character's width and height,
-but they define the image dimensions. 
-
-=item *
-
-No outside images. Captchas are generated with the GD::SecurityImage
-interface, not with third party "letter" graphics (but you can use true 
-type fonts, see C<gdsi> method). As a side effect, captcha size is not 
-(actually "can not be") determined automatically. so, you have to specify 
-a width and height value at the beginning.
-
-=item *
-
-Setting C<images_folder> has no effect.
-
-=item *
-
-No background images. Backgrounds are drawn with GD::SecurityImage styles.
-
-=item *
-
-You have to specify a TTF font, if you want to use another font (other than GD
-built-in C<GD::Font-E<gt>Giant>).
-
-=item *
-
-Setting C<debug> has no effect. You can still set C<debug>, but it is not used 
-inside this module.
-
-=back
-
-=head1 SEE ALSO
-
-L<GD::SecurityImage>, L<Authen::Captcha>.
-
-=head1 AUTHOR
-
-Burak Gürsoy, E<lt>burakE<64>cpan.orgE<gt>
-
-=head1 COPYRIGHT
-
-Copyright 2005-2006 Burak Gürsoy. All rights reserved.
-
-Some portions of this module adapted from L<Authen::Captcha>. 
-L<Authen::Captcha> Copyright 2003 by First Productions, Inc. & Seth Jackson.
-
-=head1 LICENSE
-
-This library is provided "AS IS" without warranty of any kind.
-
-This library is free software; you can redistribute it and/or modify 
-it under the same terms as Perl itself, either Perl version 5.8.7 or, 
-at your option, any later version of Perl 5 you may have available.
-
-=cut
